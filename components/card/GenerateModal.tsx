@@ -13,7 +13,8 @@ import {
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { z } from "zod";
-import { Badge, Button, Card, Modal, Spinner } from "@/components/ui";
+import { Badge, Button, Card, Input, Modal, Spinner } from "@/components/ui";
+import { isYouTubeUrl } from "@/lib/youtube";
 import { cardSourceTypeValues, type CardRecord } from "@/types";
 import { cn } from "@/lib/utils";
 
@@ -29,6 +30,12 @@ const previewCardSchema = z.object({
 const generatePreviewResponseSchema = z.object({
   cards: z.array(previewCardSchema).min(1).max(50),
   count: z.number().int().min(1).max(50),
+});
+
+const youtubeTranscriptionResponseSchema = z.object({
+  language: z.string().trim().min(1),
+  text: z.string().trim().min(1),
+  title: z.string().trim().min(1),
 });
 
 const importedCardSchema = z.object({
@@ -55,9 +62,9 @@ const stepLabels: Record<(typeof stepOrder)[number], string> = {
 };
 
 type GenerateStep = (typeof stepOrder)[number];
-type SourceType = "text" | "pdf";
+type SourceType = "text" | "pdf" | "youtube";
 type Language = "fr" | "en";
-type FieldErrorKey = "content" | "pdf";
+type FieldErrorKey = "content" | "pdf" | "youtubeUrl";
 
 interface PreviewCard {
   back: string;
@@ -65,6 +72,12 @@ interface PreviewCard {
   front: string;
   id: string;
   selected: boolean;
+}
+
+interface YouTubeTranscriptPreview {
+  language: string;
+  text: string;
+  title: string;
 }
 
 interface GenerateModalProps {
@@ -140,7 +153,45 @@ function getPdfValidationError(file: File | null): string | null {
   return null;
 }
 
-function buildSourceErrorMap(sourceType: SourceType, content: string, pdfFile: File | null) {
+function getYoutubeUrlError(youtubeUrl: string): string | null {
+  const parsedUrl = z
+    .string()
+    .trim()
+    .min(1, "Ajoute une URL YouTube.")
+    .refine((value: string) => isYouTubeUrl(value), "Ajoute une URL YouTube valide.")
+    .safeParse(youtubeUrl);
+
+  if (!parsedUrl.success) {
+    return parsedUrl.error.issues[0]?.message ?? "Ajoute une URL YouTube valide.";
+  }
+
+  return null;
+}
+
+function getYoutubeValidationError(
+  youtubeUrl: string,
+  youtubeTranscript: YouTubeTranscriptPreview | null,
+): string | null {
+  const urlError = getYoutubeUrlError(youtubeUrl);
+
+  if (urlError) {
+    return urlError;
+  }
+
+  if (!youtubeTranscript || youtubeTranscript.text.trim().length === 0) {
+    return "Extrais la transcription avant de continuer.";
+  }
+
+  return null;
+}
+
+function buildSourceErrorMap(
+  sourceType: SourceType,
+  content: string,
+  pdfFile: File | null,
+  youtubeUrl: string,
+  youtubeTranscript: YouTubeTranscriptPreview | null,
+) {
   if (sourceType === "text") {
     const parsedContent = z
       .string()
@@ -152,12 +203,22 @@ function buildSourceErrorMap(sourceType: SourceType, content: string, pdfFile: F
     return {
       content: parsedContent.success ? undefined : parsedContent.error.issues[0]?.message,
       pdf: undefined,
+      youtubeUrl: undefined,
+    } satisfies Partial<Record<FieldErrorKey, string>>;
+  }
+
+  if (sourceType === "youtube") {
+    return {
+      content: undefined,
+      pdf: undefined,
+      youtubeUrl: getYoutubeValidationError(youtubeUrl, youtubeTranscript) ?? undefined,
     } satisfies Partial<Record<FieldErrorKey, string>>;
   }
 
   return {
     content: undefined,
     pdf: getPdfValidationError(pdfFile) ?? undefined,
+    youtubeUrl: undefined,
   } satisfies Partial<Record<FieldErrorKey, string>>;
 }
 
@@ -252,21 +313,29 @@ export function GenerateModal({
   const [sourceType, setSourceType] = useState<SourceType>("text");
   const [content, setContent] = useState("");
   const [pdfFile, setPdfFile] = useState<File | null>(null);
+  const [youtubeUrl, setYoutubeUrl] = useState("");
+  const [youtubeTranscript, setYoutubeTranscript] = useState<YouTubeTranscriptPreview | null>(
+    null,
+  );
   const [cardCount, setCardCount] = useState(20);
   const [language, setLanguage] = useState<Language>("fr");
   const [fieldErrors, setFieldErrors] = useState<Partial<Record<FieldErrorKey, string>>>({});
   const [formError, setFormError] = useState<string | null>(null);
   const [isDragActive, setIsDragActive] = useState(false);
+  const [isExtractingTranscript, setIsExtractingTranscript] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
   const [previewCards, setPreviewCards] = useState<PreviewCard[]>([]);
   const [importedCount, setImportedCount] = useState(0);
+  const youtubeGenerationText = youtubeTranscript?.text.slice(0, MAX_TEXT_LENGTH) ?? "";
+  const isYoutubeTranscriptTruncated =
+    youtubeTranscript !== null && youtubeTranscript.text.length > MAX_TEXT_LENGTH;
 
   const selectedCount = useMemo(
     () => previewCards.filter((card) => card.selected).length,
     [previewCards],
   );
-  const isBusy = isGenerating || isImporting;
+  const isBusy = isExtractingTranscript || isGenerating || isImporting;
 
   function handleClose(): void {
     if (isBusy) {
@@ -282,11 +351,14 @@ export function GenerateModal({
       setSourceType("text");
       setContent("");
       setPdfFile(null);
+      setYoutubeUrl("");
+      setYoutubeTranscript(null);
       setCardCount(20);
       setLanguage("fr");
       setFieldErrors({});
       setFormError(null);
       setIsDragActive(false);
+      setIsExtractingTranscript(false);
       setIsGenerating(false);
       setIsImporting(false);
       setPreviewCards([]);
@@ -301,10 +373,16 @@ export function GenerateModal({
   }
 
   function handleSourceValidation(): boolean {
-    const nextErrors = buildSourceErrorMap(sourceType, content, pdfFile);
+    const nextErrors = buildSourceErrorMap(
+      sourceType,
+      content,
+      pdfFile,
+      youtubeUrl,
+      youtubeTranscript,
+    );
     setFieldErrors(nextErrors);
 
-    return !nextErrors.content && !nextErrors.pdf;
+    return !nextErrors.content && !nextErrors.pdf && !nextErrors.youtubeUrl;
   }
 
   function handleFileSelection(file: File | null): void {
@@ -315,6 +393,59 @@ export function GenerateModal({
     }));
     setFormError(null);
     clearGenerationResult();
+  }
+
+  async function handleYoutubeExtraction(): Promise<void> {
+    const urlError = getYoutubeUrlError(youtubeUrl);
+
+    if (urlError) {
+      setFieldErrors({ youtubeUrl: urlError });
+      setYoutubeTranscript(null);
+      return;
+    }
+
+    setFieldErrors((currentErrors) => ({
+      ...currentErrors,
+      youtubeUrl: undefined,
+    }));
+    setFormError(null);
+    clearGenerationResult();
+    setIsExtractingTranscript(true);
+
+    try {
+      const response = await fetch("/api/transcribe/youtube", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        credentials: "same-origin",
+        body: JSON.stringify({
+          url: youtubeUrl,
+        }),
+      });
+      const responsePayload = await readResponsePayload(response);
+
+      if (!response.ok) {
+        throw new Error(
+          getApiErrorMessage(responsePayload, "La transcription YouTube n'a pas abouti."),
+        );
+      }
+
+      const parsed = youtubeTranscriptionResponseSchema.safeParse(responsePayload);
+
+      if (!parsed.success) {
+        throw new Error("La reponse de transcription est invalide.");
+      }
+
+      setYoutubeTranscript(parsed.data);
+    } catch (error) {
+      setYoutubeTranscript(null);
+      setFormError(
+        error instanceof Error ? error.message : "Une erreur est survenue pendant l'extraction.",
+      );
+    } finally {
+      setIsExtractingTranscript(false);
+    }
   }
 
   async function handleGeneratePreview(): Promise<void> {
@@ -340,8 +471,8 @@ export function GenerateModal({
             }
           : {
               deckId,
-              sourceType,
-              content,
+              sourceType: "text" as const,
+              content: sourceType === "youtube" ? youtubeGenerationText : content,
               cardCount,
               language,
               persist: false,
@@ -567,7 +698,7 @@ export function GenerateModal({
           <div className="grid gap-lg xl:grid-cols-[minmax(0,1fr)_260px]">
             <div className="space-y-md">
               <div className="inline-flex rounded-full border border-outline-subtle bg-surface-overlay p-[4px]">
-                {(["text", "pdf"] as const).map((value) => {
+                {(["text", "pdf", "youtube"] as const).map((value) => {
                   const isActive = sourceType === value;
 
                   return (
@@ -587,7 +718,7 @@ export function GenerateModal({
                       }}
                       type="button"
                     >
-                      {value === "text" ? "Texte" : "PDF"}
+                      {value === "text" ? "Texte" : value === "pdf" ? "PDF" : "YouTube"}
                     </button>
                   );
                 })}
@@ -619,7 +750,7 @@ export function GenerateModal({
                       value={content}
                     />
                   </motion.div>
-                ) : (
+                ) : sourceType === "pdf" ? (
                   <motion.div
                     animate={{ opacity: 1, y: 0 }}
                     className="space-y-md"
@@ -700,6 +831,94 @@ export function GenerateModal({
                       <p className="text-xs text-danger">{fieldErrors.pdf}</p>
                     ) : null}
                   </motion.div>
+                ) : (
+                  <motion.div
+                    animate={{ opacity: 1, y: 0 }}
+                    className="space-y-md"
+                    initial={{ opacity: 0, y: 8 }}
+                    key="youtube"
+                    transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+                  >
+                    <div className="grid gap-md lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end">
+                      <Input
+                        autoComplete="off"
+                        error={fieldErrors.youtubeUrl}
+                        hint="Colle une URL YouTube publique avec des sous-titres disponibles."
+                        label="URL YouTube"
+                        onChange={(event) => {
+                          setYoutubeUrl(event.target.value);
+                          setYoutubeTranscript(null);
+                          setFieldErrors((currentErrors) => ({
+                            ...currentErrors,
+                            youtubeUrl: undefined,
+                          }));
+                          setFormError(null);
+                          clearGenerationResult();
+                        }}
+                        placeholder="https://www.youtube.com/watch?v=..."
+                        value={youtubeUrl}
+                      />
+
+                      <Button
+                        className="min-w-[150px]"
+                        disabled={isExtractingTranscript}
+                        onClick={() => void handleYoutubeExtraction()}
+                        variant="secondary"
+                      >
+                        {isExtractingTranscript ? (
+                          <Spinner label="Extraction" size="sm" />
+                        ) : (
+                          <FileText className="h-4 w-4" />
+                        )}
+                        {isExtractingTranscript ? "Extraction..." : "Extraire"}
+                      </Button>
+                    </div>
+
+                    {youtubeTranscript ? (
+                      <Card className="rounded-xl bg-app-canvas">
+                        <div className="space-y-md">
+                          <div className="flex flex-wrap items-center gap-sm">
+                            <Badge variant="accent">Transcription prete</Badge>
+                            <Badge variant="info">{youtubeTranscript.language.toUpperCase()}</Badge>
+                            {isYoutubeTranscriptTruncated ? (
+                              <Badge variant="warning">Coupee a 15 000 caracteres</Badge>
+                            ) : null}
+                          </div>
+
+                          <div>
+                            <h3 className="text-lg font-medium text-ink-primary">
+                              {youtubeTranscript.title}
+                            </h3>
+                            <p className="mt-sm text-sm text-ink-secondary">
+                              {youtubeTranscript.text.length} caracteres extraits.
+                            </p>
+                          </div>
+
+                          <div className="rounded-lg border border-outline-subtle bg-surface-overlay px-md py-md">
+                            <p className="text-xs uppercase tracking-label text-ink-secondary">
+                              Apercu transcription
+                            </p>
+                            <p className="mt-sm whitespace-pre-wrap text-sm text-ink-primary">
+                              {youtubeTranscript.text.slice(0, 200)}
+                              {youtubeTranscript.text.length > 200 ? "..." : ""}
+                            </p>
+                          </div>
+                        </div>
+                      </Card>
+                    ) : (
+                      <Card className="rounded-xl border-dashed border-outline">
+                        <div className="space-y-sm">
+                          <div className="flex items-center gap-sm text-ink-secondary">
+                            <FileText className="h-4 w-4" />
+                            <p className="text-sm">Extrais la transcription avant generation</p>
+                          </div>
+                          <p className="text-sm text-ink-secondary">
+                            Lumino utilisera ensuite ce texte comme une source classique pour generer l&apos;apercu de cartes.
+                          </p>
+                        </div>
+                      </Card>
+                    )}
+                  </motion.div>
                 )}
               </AnimatePresence>
             </div>
@@ -719,7 +938,11 @@ export function GenerateModal({
                     Source active
                   </p>
                   <p className="mt-sm text-sm text-ink-primary">
-                    {sourceType === "text" ? "Texte brut" : "Document PDF"}
+                    {sourceType === "text"
+                      ? "Texte brut"
+                      : sourceType === "pdf"
+                        ? "Document PDF"
+                        : "Video YouTube"}
                   </p>
                 </div>
               </div>
@@ -798,9 +1021,13 @@ export function GenerateModal({
                   <p className="text-sm text-ink-primary">
                     {sourceType === "text"
                       ? `${content.trim().length} caracteres analyses`
-                      : pdfFile
-                        ? `${pdfFile.name} (${formatBytes(pdfFile.size)})`
-                        : "Aucun PDF"}
+                      : sourceType === "pdf"
+                        ? pdfFile
+                          ? `${pdfFile.name} (${formatBytes(pdfFile.size)})`
+                          : "Aucun PDF"
+                        : youtubeTranscript
+                          ? `${youtubeTranscript.title} (${youtubeGenerationText.length} caracteres analyses)`
+                          : "Aucune transcription"}
                   </p>
                 </div>
 
@@ -815,6 +1042,9 @@ export function GenerateModal({
 
                 <p className="text-sm text-ink-secondary">
                   Lumino va generer un apercu, puis tu choisiras exactement quelles cartes importer.
+                  {sourceType === "youtube" && isYoutubeTranscriptTruncated
+                    ? " La transcription sera limitee aux 15 000 premiers caracteres."
+                    : ""}
                 </p>
               </div>
             </Card>

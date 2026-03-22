@@ -154,21 +154,28 @@ export async function generateCardsFromSource(params: {
     throw new GenerateRouteError("Source text is empty.", 400);
   }
 
-  const message = await client.messages.parse({
-    model: GENERATED_CARD_MODEL,
-    max_tokens: GENERATED_CARD_MAX_TOKENS,
-    temperature: GENERATED_CARD_TEMPERATURE,
-    system: buildSystemPrompt(params.cardCount, params.language),
-    messages: [
-      {
-        role: "user",
-        content: buildUserPrompt(sourceText, params.cardCount, params.language),
+  let message;
+
+  try {
+    message = await client.messages.parse({
+      model: GENERATED_CARD_MODEL,
+      max_tokens: GENERATED_CARD_MAX_TOKENS,
+      temperature: GENERATED_CARD_TEMPERATURE,
+      system: buildSystemPrompt(params.cardCount, params.language),
+      messages: [
+        {
+          role: "user",
+          content: buildUserPrompt(sourceText, params.cardCount, params.language),
+        },
+      ],
+      output_config: {
+        format: zodOutputFormat(generatedCardResponseSchema),
       },
-    ],
-    output_config: {
-      format: zodOutputFormat(generatedCardResponseSchema),
-    },
-  });
+    });
+  } catch (error) {
+    console.error("[generateCardsFromSource] Anthropic request failed", error);
+    throw error;
+  }
 
   const parsedOutput = message.parsed_output;
 

@@ -410,3 +410,30 @@ T-001 → T-002 → T-003 → T-004
       → T-018 → T-019
       → T-020 → T-021
 ```
+
+T-022 · Source YouTube (transcription)
+- Installer : npm install youtube-transcript
+- Nouvelle API route : POST /api/transcribe/youtube
+  Input : { url: string } (valider que c'est une URL YouTube)
+  Process : extraire transcription via YoutubeTranscript.fetchTranscript()
+  Output : { text: string, title: string, language: string }
+- Ajouter tab "YouTube" dans GenerateModal (étape Source)
+  UI : champ URL + bouton "Extraire" + preview des 200 premiers 
+  caractères de la transcription avant génération
+- Gestion erreur : "Aucun sous-titre disponible pour cette vidéo"
+
+T-023 · Source Audio (Whisper)
+- Installer : pas de lib supplémentaire, appel direct API OpenAI
+- Ajouter OPENAI_API_KEY dans .env.local et Vercel
+- Nouvelle API route : POST /api/transcribe/audio
+  Input : fichier audio en multipart/form-data (max 25MB — limite Whisper)
+  Process : envoi à api.openai.com/v1/audio/transcriptions (model: whisper-1)
+  Output : { text: string, duration: number }
+- Ajouter tab "Audio" dans GenerateModal (étape Source)
+  UI : drag & drop (mp3, m4a, wav, webm) + indicateur de durée estimée
+  + warning coût approximatif ("~$0.006/min")
+- Gestion erreur : fichier trop grand, format non supporté
+
+Ces deux sources s'intègrent dans le flow existant GenerateModal :
+après transcription, le texte est passé comme sourceType "text" 
+à /api/generate existant. Pas de nouveau champ en DB nécessaire.

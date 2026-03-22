@@ -139,6 +139,7 @@ export async function POST(request: Request): Promise<Response> {
       { status: 201 },
     );
   } catch (error) {
+    console.error("[generate] request failed", error);
     return createGenerateErrorResponse(error);
   }
 }
